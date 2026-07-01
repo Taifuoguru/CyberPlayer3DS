@@ -1,4 +1,5 @@
-main.o: C:/Users/MSI/Desktop/CyberPlayer3DS/source/main.c \
+main.o: \
+ C:/Users/MSI/Documents/Codex/2026-07-01/CyberPlayer3DS/source/main.c \
  C:/devkitPro/libctru/include/3ds.h \
  C:/devkitPro/libctru/include/3ds/types.h \
  C:/devkitPro/libctru/include/3ds/result.h \
@@ -86,7 +87,9 @@ main.o: C:/Users/MSI/Desktop/CyberPlayer3DS/source/main.c \
  C:/devkitPro/libctru/include/3ds/font.h \
  C:/devkitPro/libctru/include/3ds/gdbhio_dev.h \
  C:/devkitPro/libctru/include/3ds/3dslink.h \
- C:/devkitPro/portlibs/3ds/include/mad.h
+ C:/devkitPro/portlibs/3ds/include/mad.h \
+ C:/Users/MSI/Documents/Codex/2026-07-01/CyberPlayer3DS/source/third_party/dr_flac.h \
+ C:/Users/MSI/Documents/Codex/2026-07-01/CyberPlayer3DS/source/third_party/stb_vorbis.c
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
 C:/devkitPro/libctru/include/3ds/result.h:
@@ -175,3 +178,5 @@ C:/devkitPro/libctru/include/3ds/font.h:
 C:/devkitPro/libctru/include/3ds/gdbhio_dev.h:
 C:/devkitPro/libctru/include/3ds/3dslink.h:
 C:/devkitPro/portlibs/3ds/include/mad.h:
+C:/Users/MSI/Documents/Codex/2026-07-01/CyberPlayer3DS/source/third_party/dr_flac.h:
+C:/Users/MSI/Documents/Codex/2026-07-01/CyberPlayer3DS/source/third_party/stb_vorbis.c:
