@@ -27,7 +27,8 @@
 
 
 
-<img width="500" height="500" alt="download" src="https://github.com/user-attachments/assets/de6cd1e0-5b8d-4945-91fe-997246378fd6" />
+<img width="270" height="279" alt="Ekran görüntüsü 2026-07-02 230219" src="https://github.com/user-attachments/assets/f28d17e5-000d-4859-9bcf-f1bdefd32cfa" />
+
 
 
 
