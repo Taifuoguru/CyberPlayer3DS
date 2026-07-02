@@ -8,7 +8,7 @@
  * - Gelismis alt UI, gear tusu, dosya listesi
  * - Dolphin, tunnel, radar, starfield, cassette, oscilloscope animasyonlari
  * - Sarki kapagi modu: MP3 icinden resim parse etmez, sarki adindan VFD cover uretir
- * - Kamera ve rotate duzeltmeleri
+ * - Ekran kapali calisma modu ve rotate duzeltmeleri
  * =====================================================
  */
 
@@ -29,9 +29,6 @@
 #define BUFFER_BOYUTU           (4096 * 4)
 #define HAM_SES_BOYUTU          (1152 * 2 * 2 * 3)
 #define MAKS_SARKI              2048
-#define CAM_W                   400
-#define CAM_H                   240
-#define CAM_BUF_SIZE            (CAM_W * CAM_H * 2)
 #define TRIG_TABLE_SIZE         8192
 
 #define VIZ_TIP_SAYISI          96
@@ -118,9 +115,13 @@ int browserUnsupportedSeen = 0;
 int browserSearchDirs = 0;
 
 bool mouseMode = false;
-bool geigerMode = true;
-bool matrixLogMode = true;
-bool cameraFlareMode = true;
+bool geigerMode = false;
+bool matrixLogMode = false;
+bool screenOffMode = false;
+bool screenBacklightOff = false;
+bool lidClosedAudioMode = false;
+bool lidWasClosed = false;
+bool headphonesInserted = false;
 bool cyberSnakeMode = false;
 bool lowBatterySim = false;
 bool tapeJamActive = false;
@@ -134,7 +135,6 @@ int micNoiseLevel = 0;
 int fakeBatteryPct = 77;
 int fakeThermalLevel = 36;
 int uiBeepCooldown = 0;
-int cameraFailFrames = 0;
 float gyroParallaxX = 0.0f;
 float gyroParallaxY = 0.0f;
 
@@ -144,6 +144,7 @@ int beepPhase = 0;
 aptHookCookie aptCookie;
 char statusMessage[96] = "SDMC READY";
 int statusMessageFrames = 0;
+int lidGuardRejectFrames = 0;
 
 float peakHold[44] = {0};
 int peakHoldDecay[44] = {0};
@@ -184,7 +185,7 @@ float globalPulse = 0.0f;
 int eqBand[7] = {100, 100, 100, 100, 100, 100, 100};
 int eqPresetIdx = 0;
 int masterVolume = 100;
-int playbackRatePct = 100;
+int playbackRatePct = 105;
 int crtFosforGucu = 150;
 
 bool shuffleMode = false;
@@ -198,12 +199,8 @@ Thread audioThread = NULL;
 volatile bool audioThreadRunning = false;
 volatile bool audioThreadPlaying = false;
 
-bool kameraAcik = false;
 bool dikModAktif = false;
 bool rotateModFull = false;
-u16* camBuffer = NULL;
-u16* camBufferPrev = NULL;
-Handle camEvent = 0;
 
 ButtonState buttons;
 UiMode uiMode = UI_STARTUP;
@@ -243,6 +240,7 @@ static inline float sin_fast(float ang);
 static inline float cos_fast(float ang);
 
 const char* getBasename(const char* path);
+const char* getCleanExtension(const char* name);
 bool isPathADirectory(const char* path);
 void setStatusMessage(const char* msg);
 void triggerUiBeep(int tone);
@@ -295,13 +293,11 @@ char normalizeChar(char c) {
 
 void cleanTrackName(const char* src, char* dst, int maxLen) {
     int di = 0;
+    const char* ext = getCleanExtension(src);
+    int stopAt = ext ? (int)(ext - src) : (int)strlen(src);
 
-    for (int i = 0; src[i] && di < maxLen - 1; i++) {
+    for (int i = 0; src[i] && i < stopAt && di < maxLen - 1; i++) {
         char c = src[i];
-
-        if (c == '.') {
-            if (strstr(src + i, ".mp3") || strstr(src + i, ".MP3")) break;
-        }
 
         if (c == '_' || c == '-') c = ' ';
         c = normalizeChar(c);
@@ -376,18 +372,21 @@ s16 audioProcessSample(s16 input, int channel) {
     float bassGain = (eqBand[0] + eqBand[1]) * 0.005f;
     float midGain = (eqBand[2] + eqBand[3] + eqBand[4]) * 0.003333f;
     float trebleGain = (eqBand[5] + eqBand[6]) * 0.005f;
-    float volGain = masterVolume / 100.0f;
+    float volGain = (masterVolume / 100.0f) * 0.92f;
 
     float y = ((bass * bassGain) + (mid * midGain) + (treble * trebleGain)) * volGain;
 
-    if (y > 32767.0f) y = 32767.0f;
-    if (y < -32768.0f) y = -32768.0f;
+    if (y > 30000.0f) y = 30000.0f + (y - 30000.0f) * 0.18f;
+    if (y < -30000.0f) y = -30000.0f + (y + 30000.0f) * 0.18f;
+    if (y > 32700.0f) y = 32700.0f;
+    if (y < -32700.0f) y = -32700.0f;
 
     return (s16)y;
 }
 
 void sesKanaliniYenidenBaslat(void) {
     ndspChnReset(SES_KANALI);
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 
     if (pcmBufferA) memset(pcmBufferA, 0, HAM_SES_BOYUTU);
     if (pcmBufferB) memset(pcmBufferB, 0, HAM_SES_BOYUTU);
@@ -398,7 +397,7 @@ void sesKanaliniYenidenBaslat(void) {
 
     ndspChnSetFormat(SES_KANALI, NDSP_FORMAT_STEREO_PCM16);
     ndspChnSetInterp(SES_KANALI, NDSP_INTERP_LINEAR);
-    float baseRate = (aktifSesFormati == AUDIO_WAV && wavSampleRate > 0) ? (float)wavSampleRate : 44100.0f;
+    float baseRate = (wavSampleRate > 0) ? (float)wavSampleRate : 44100.0f;
     ndspChnSetRate(SES_KANALI, baseRate * ((float)playbackRatePct / 100.0f));
 
     memset(sesMiksaji, 0, sizeof(sesMiksaji));
@@ -501,9 +500,101 @@ void triggerLidAnimation(void) {
     lidAnimFrame = 0;
 }
 
+void setScreenOffMode(bool enabled) {
+    screenOffMode = enabled;
+
+    if (enabled) {
+        if (!screenBacklightOff) {
+            GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTH);
+            screenBacklightOff = true;
+        }
+        setStatusMessage("SCREEN OFF AUDIO MODE");
+    } else {
+        if (screenBacklightOff) {
+            GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+            screenBacklightOff = false;
+        }
+        setStatusMessage("SCREEN ONLINE");
+    }
+
+    triggerLidAnimation();
+}
+
+void rejectSystemSleepNow(void) {
+    aptSetSleepAllowed(false);
+    APT_ReplySleepQuery(envGetAptAppId(), APTREPLY_REJECT);
+    lidGuardRejectFrames = 45;
+}
+
+bool refreshLidAudioGuard(void) {
+    u8 shellState = 1;
+    bool shellClosed = false;
+    bool headphoneNow = false;
+
+    if (R_SUCCEEDED(PTMU_GetShellState(&shellState))) {
+        shellClosed = (shellState == 0);
+    }
+
+    if (R_SUCCEEDED(DSP_GetHeadphoneStatus(&headphoneNow))) {
+        headphonesInserted = headphoneNow;
+    }
+
+    if (shellClosed) {
+        rejectSystemSleepNow();
+        lidClosedAudioMode = true;
+        screenOffMode = true;
+        ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+
+        if (!lidWasClosed) {
+            lidWasClosed = true;
+            triggerLidAnimation();
+            if (headphonesInserted) {
+                setStatusMessage("LID AUDIO: HEADPHONES");
+            } else {
+                setStatusMessage("LID AUDIO NEEDS PHONES");
+            }
+        }
+    } else {
+        if (lidWasClosed) {
+            lidWasClosed = false;
+            lidClosedAudioMode = false;
+            screenOffMode = false;
+            if (screenBacklightOff) {
+                GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+                screenBacklightOff = false;
+            }
+            if (caliyor) {
+                audioThreadPlaying = true;
+                sesKanaliniYenidenBaslat();
+            }
+            triggerLidAnimation();
+            setStatusMessage("LID OPEN AUDIO RESTORE");
+        }
+    }
+
+    if (lidGuardRejectFrames > 0) {
+        lidGuardRejectFrames--;
+        aptSetSleepAllowed(false);
+        APT_ReplySleepQuery(envGetAptAppId(), APTREPLY_REJECT);
+    }
+
+    return shellClosed;
+}
+
 void aptEventHook(APT_HookType hook, void* param) {
     (void)param;
-    if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONRESTORE) {
+    if (hook == APTHOOK_ONSUSPEND) {
+        rejectSystemSleepNow();
+        triggerLidAnimation();
+    } else if (hook == APTHOOK_ONRESTORE) {
+        rejectSystemSleepNow();
+        if (caliyor) {
+            audioThreadPlaying = true;
+            sesKanaliniYenidenBaslat();
+        }
+        triggerLidAnimation();
+    } else if (hook == APTHOOK_ONSLEEP || hook == APTHOOK_ONWAKEUP) {
+        rejectSystemSleepNow();
         triggerLidAnimation();
     }
 }
@@ -535,10 +626,15 @@ AudioFormat audioFormatFromName(const char* name) {
 
     if (extEquals(ext, ".mp3")) return AUDIO_MP3;
     if (extEquals(ext, ".wav")) return AUDIO_WAV;
+    if (extEquals(ext, ".wave")) return AUDIO_WAV;
     if (extEquals(ext, ".flac")) return AUDIO_FLAC;
+    if (extEquals(ext, ".fla")) return AUDIO_FLAC;
     if (extEquals(ext, ".ogg")) return AUDIO_OGG;
+    if (extEquals(ext, ".oga")) return AUDIO_OGG;
     if (extEquals(ext, ".aac")) return AUDIO_AAC;
     if (extEquals(ext, ".m4a")) return AUDIO_M4A;
+    if (extEquals(ext, ".mp4")) return AUDIO_M4A;
+    if (extEquals(ext, ".3gp")) return AUDIO_M4A;
     if (extEquals(ext, ".opus")) return AUDIO_OPUS;
 
     return AUDIO_NONE;
@@ -548,7 +644,7 @@ AudioFormat audioFormatFromHeader(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return AUDIO_NONE;
 
-    u8 b[16];
+    u8 b[256];
     size_t n = fread(b, 1, sizeof(b), f);
     fclose(f);
 
@@ -559,6 +655,11 @@ AudioFormat audioFormatFromHeader(const char* path) {
     if (n >= 4 && memcmp(b, "OggS", 4) == 0) return AUDIO_OGG;
     if (n >= 2 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0) return AUDIO_AAC;
     if (n >= 12 && memcmp(b + 4, "ftyp", 4) == 0) return AUDIO_M4A;
+
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (memcmp(b + i, "fLaC", 4) == 0) return AUDIO_FLAC;
+        if (memcmp(b + i, "OggS", 4) == 0) return AUDIO_OGG;
+    }
 
     return AUDIO_NONE;
 }
@@ -728,16 +829,20 @@ void loadDirectory(const char* path) {
         char fullPath[512];
         snprintf(fullPath, sizeof(fullPath), "%s%s", currentDir, ent->d_name);
         
+        AudioFormat nameFmt = audioFormatFromName(ent->d_name);
+        bool nameLooksAudio = (nameFmt != AUDIO_NONE);
         bool isDir = false;
-        #ifdef DT_DIR
-        if (ent->d_type == DT_DIR) {
-            isDir = true;
-        } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+        if (!nameLooksAudio) {
+            #ifdef DT_DIR
+            if (ent->d_type == DT_DIR) {
+                isDir = true;
+            } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+                isDir = isPathADirectory(fullPath);
+            }
+            #else
             isDir = isPathADirectory(fullPath);
+            #endif
         }
-        #else
-        isDir = isPathADirectory(fullPath);
-        #endif
         
         if (isDir) {
             browserDirSeen++;
@@ -747,11 +852,13 @@ void loadDirectory(const char* path) {
             browserEntryCount++;
         } else {
             browserFileSeen++;
-            AudioFormat fmt = audioFormatFromFile(fullPath, ent->d_name);
+            AudioFormat fmt = nameLooksAudio ? nameFmt : audioFormatFromFile(fullPath, ent->d_name);
 
-            if (fmt != AUDIO_NONE) {
-                browserAudioSeen++;
-                if (fmt == AUDIO_UNSUPPORTED) browserUnsupportedSeen++;
+            if (fmt == AUDIO_NONE) continue;
+
+            browserAudioSeen++;
+            if (fmt == AUDIO_AAC || fmt == AUDIO_M4A || fmt == AUDIO_OPUS || fmt == AUDIO_UNSUPPORTED) {
+                browserUnsupportedSeen++;
             }
 
             browserEntries[browserEntryCount].isDirectory = false;
@@ -802,16 +909,20 @@ void scanAudioRecursive(const char* dirPath, int depth) {
         memcpy(fullPath, dirPath, dirLen);
         memcpy(fullPath + dirLen, ent->d_name, nameLen + 1);
 
+        AudioFormat nameFmt = audioFormatFromName(ent->d_name);
+        bool nameLooksAudio = (nameFmt != AUDIO_NONE);
         bool isDir = false;
-        #ifdef DT_DIR
-        if (ent->d_type == DT_DIR) {
-            isDir = true;
-        } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+        if (!nameLooksAudio) {
+            #ifdef DT_DIR
+            if (ent->d_type == DT_DIR) {
+                isDir = true;
+            } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+                isDir = isPathADirectory(fullPath);
+            }
+            #else
             isDir = isPathADirectory(fullPath);
+            #endif
         }
-        #else
-        isDir = isPathADirectory(fullPath);
-        #endif
 
         if (isDir) {
             browserDirSeen++;
@@ -823,7 +934,7 @@ void scanAudioRecursive(const char* dirPath, int depth) {
             scanAudioRecursive(fullPath, depth + 1);
         } else {
             browserFileSeen++;
-            AudioFormat fmt = audioFormatFromFile(fullPath, ent->d_name);
+            AudioFormat fmt = nameLooksAudio ? nameFmt : audioFormatFromFile(fullPath, ent->d_name);
             addAudioSearchHit(fullPath, ent->d_name, fmt);
         }
     }
@@ -871,16 +982,20 @@ void processAudioSearchStep(int maxDirs) {
             memcpy(fullPath, dirPath, dirLen);
             memcpy(fullPath + dirLen, ent->d_name, nameLen + 1);
 
+            AudioFormat nameFmt = audioFormatFromName(ent->d_name);
+            bool nameLooksAudio = (nameFmt != AUDIO_NONE);
             bool isDir = false;
-            #ifdef DT_DIR
-            if (ent->d_type == DT_DIR) {
-                isDir = true;
-            } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+            if (!nameLooksAudio) {
+                #ifdef DT_DIR
+                if (ent->d_type == DT_DIR) {
+                    isDir = true;
+                } else if (ent->d_type == DT_UNKNOWN || ent->d_type == 0) {
+                    isDir = isPathADirectory(fullPath);
+                }
+                #else
                 isDir = isPathADirectory(fullPath);
+                #endif
             }
-            #else
-            isDir = isPathADirectory(fullPath);
-            #endif
 
             if (isDir) {
                 browserDirSeen++;
@@ -892,7 +1007,7 @@ void processAudioSearchStep(int maxDirs) {
                 audioSearchQueuePush(fullPath);
             } else {
                 browserFileSeen++;
-                AudioFormat fmt = audioFormatFromFile(fullPath, ent->d_name);
+                AudioFormat fmt = nameLooksAudio ? nameFmt : audioFormatFromFile(fullPath, ent->d_name);
                 addAudioSearchHit(fullPath, ent->d_name, fmt);
             }
         }
@@ -1623,10 +1738,10 @@ void rastgeleAnimasyonSec(void) {
     );
 }
 
-void crtEkranTemizle(u8* fb, bool top, bool kameraKullanimda) {
+void crtEkranTemizle(u8* fb, bool top, bool direktTemizle) {
     int toplam = (top ? 400 : 320) * 240 * 3;
 
-    if (kameraKullanimda || crtFosforGucu == 0) {
+    if (direktTemizle || crtFosforGucu == 0) {
         memset(fb, 0, toplam);
         return;
     }
@@ -1653,112 +1768,6 @@ void drawScanlines(u8* fb, bool top) {
                 fb[idx + 2] = (fb[idx + 2] * dim) / 100;
             }
         }
-    }
-}
-
-void kameraBaslat(void) {
-    if (kameraAcik) return;
-
-    if (R_FAILED(camInit())) {
-        setStatusMessage("CAMERA INIT FAILED");
-        return;
-    }
-
-    camBuffer = (u16*)linearAlloc(CAM_BUF_SIZE);
-    camBufferPrev = (u16*)linearAlloc(CAM_BUF_SIZE);
-
-    if (!camBuffer || !camBufferPrev) {
-        if (camBuffer) linearFree(camBuffer);
-        if (camBufferPrev) linearFree(camBufferPrev);
-        camBuffer = NULL;
-        camBufferPrev = NULL;
-        camExit();
-        setStatusMessage("CAMERA BUFFER FAILED");
-        return;
-    }
-
-    memset(camBuffer, 0, CAM_BUF_SIZE);
-    memset(camBufferPrev, 0, CAM_BUF_SIZE);
-
-    CAMU_Activate(SELECT_OUT1);
-    CAMU_SetSize(SELECT_OUT1, SIZE_CTR_TOP_LCD, CONTEXT_A);
-    CAMU_SetOutputFormat(SELECT_OUT1, OUTPUT_RGB_565, CONTEXT_A);
-    CAMU_SetFrameRate(SELECT_OUT1, FRAME_RATE_30);
-
-    svcCreateEvent(&camEvent, RESET_ONESHOT);
-    CAMU_SetReceiving(&camEvent, camBuffer, SELECT_OUT1, CAM_BUF_SIZE, (s16)CAM_W);
-    CAMU_StartCapture(SELECT_OUT1);
-
-    kameraAcik = true;
-    setStatusMessage("CAMERA ONLINE");
-}
-
-void kameraKapat(void) {
-    if (!kameraAcik) return;
-
-    CAMU_StopCapture(SELECT_OUT1);
-    CAMU_Activate(SELECT_NONE);
-    svcCloseHandle(camEvent);
-
-    if (camBuffer) linearFree(camBuffer);
-    if (camBufferPrev) linearFree(camBufferPrev);
-
-    camBuffer = NULL;
-    camBufferPrev = NULL;
-
-    camExit();
-    kameraAcik = false;
-    setStatusMessage("CAMERA OFF");
-}
-
-void kameraFrameCek(u8* fb, bool ustEkran) {
-    if (!kameraAcik || !camBuffer || !fb) return;
-    bool yeniFrame = (svcWaitSynchronization(camEvent, 0) == 0);
-
-    if (!yeniFrame) {
-        cameraFailFrames++;
-        drawKenwoodShell(fb);
-        textDrawCentered(fb, "CAMERA SIGNAL WAIT", 96, 255, 180, 60, true);
-        textDrawCentered(fb, "CHECK 3DS CAMERA ACCESS", 116, 0, 255, 180, true);
-        for (int i = 0; i < 18; i++) {
-            int y = 54 + i * 7;
-            gfxLine(fb, 56, y, 344, y + (int)(sin_fast(frameSayaci * 0.04f + i) * 3), 0, 80, 120, true);
-        }
-        return;
-    }
-    cameraFailFrames = 0;
-
-    int outW = CAM_W / 2;
-    int outH = CAM_H / 2;
-    int startX = (400 - outW) / 2;
-    int startY = (240 - outH) / 2;
-
-    for (int sy = 0; sy < CAM_H; sy += 2) {
-        for (int sx = 0; sx < CAM_W; sx += 2) {
-            u16 px = camBuffer[sy * CAM_W + sx];
-
-            u8 r = (u8)(((px >> 11) & 0x1F) << 3);
-            u8 g = (u8)(((px >> 5) & 0x3F) << 2);
-            u8 b = (u8)((px & 0x1F) << 3);
-
-            int tx = startX + sx / 2;
-            int ty = startY + sy / 2;
-
-            pixelDraw(fb, tx, ty, r, g, b, true);
-
-            if (cameraFlareMode && ((sx + sy + frameSayaci) % 97) == 0) {
-                int bright = r + g + b;
-                if (bright > 420) {
-                    gfxGlowPixel(fb, tx, ty, 255, 220, 120, true);
-                    gfxLine(fb, tx - 4, ty, tx + 4, ty, 255, 200, 80, true);
-                }
-            }
-        }
-    }
-
-    if (yeniFrame) {
-        svcClearEvent(camEvent);
-        CAMU_SetReceiving(&camEvent, camBuffer, SELECT_OUT1, CAM_BUF_SIZE, (s16)CAM_W);
     }
 }
 
@@ -12788,7 +12797,7 @@ void drawSettings(u8* fb) {
     const char* labels[] = {
         "EQ 60HZ", "EQ 150HZ", "EQ 400HZ", "EQ 1KHZ", "EQ 3KHZ", "EQ 8KHZ", "EQ 14KHZ",
         "VOLUME", "SPEED", "CRT GLOW", "COVER MODE", "SHUFFLE", "REPEAT", "AUTO VIZ",
-        "SCANLINE GAP", "SCANLINE STR", "MATRIX LOG", "MOUSE MODE", "GEIGER MODE", "CAM FLARE",
+        "SCANLINE GAP", "SCANLINE STR", "MATRIX LOG", "MOUSE MODE", "GEIGER MODE", "SCREEN OFF",
         "CYBER SNAKE", "LOW BATT SIM", "THERMAL", "BATT PCT", "MIC NOISE", "LID ANIM", "TAPE JAM", "PANIC RESET"
     };
 
@@ -12804,7 +12813,7 @@ void drawSettings(u8* fb) {
         matrixLogMode ? 1 : 0,
         mouseMode ? 1 : 0,
         geigerMode ? 1 : 0,
-        cameraFlareMode ? 1 : 0,
+        screenOffMode ? 1 : 0,
         cyberSnakeMode ? 1 : 0,
         lowBatterySim ? 1 : 0,
         fakeThermalLevel,
@@ -12869,7 +12878,7 @@ void drawBottomDeck(u8* fb) {
 
     if (coverMode) textDraw(fb, "COVER", 78, 74, 255, 180, 60, false);
     if (otomatikDegistir) textDraw(fb, "AUTO", 128, 74, 255, 130, 40, false);
-    if (kameraAcik) textDraw(fb, "CAM", 176, 74, 0, 255, 100, false);
+    if (screenOffMode) textDraw(fb, "SLEEP", 176, 74, 0, 255, 100, false);
     if (rotateModFull) textDraw(fb, "ROT", 216, 74, 255, 200, 0, false);
     if (aktifSesFormati == AUDIO_WAV) textDraw(fb, "WAV", 258, 74, 255, 210, 80, false);
     else if (aktifSesFormati == AUDIO_FLAC) textDraw(fb, "FLC", 258, 74, 255, 210, 80, false);
@@ -12906,7 +12915,7 @@ void drawBottomDeck(u8* fb) {
     textDraw(fb, ">", 223, 197, 255, 255, 255, false);
     textDraw(fb, ">>", 275, 197, 255, 255, 255, false);
 
-    textDraw(fb, "A PLAY  X CAM  Y AUTO  B ROT", 18, 152, 255, 190, 70, false);
+    textDraw(fb, "A PLAY  X SCREEN  Y AUTO  B FILES", 18, 152, 255, 190, 70, false);
     textDraw(fb, "L SHUF  R REP  SELECT HOLD", 18, 164, 90, 255, 160, false);
 
     drawCdInsertBottomAnim(fb);
@@ -12944,7 +12953,7 @@ void renderFrame(void) {
     }
 
     u8* fbTopL = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-    crtEkranTemizle(fbTopL, true, kameraAcik);
+    crtEkranTemizle(fbTopL, true, false);
 
     if (uiMode == UI_STARTUP) {
         drawStartup(fbTopL, true);
@@ -12952,8 +12961,6 @@ void renderFrame(void) {
         drawShutdown(fbTopL, true);
     } else if (stationStaticFrames > 0) {
         drawStationStatic(fbTopL, true);
-    } else if (kameraAcik) {
-        kameraFrameCek(fbTopL, true);
     } else {
         vfdProsedurelCizim(fbTopL, slider3D, false);
     }
@@ -12963,7 +12970,7 @@ void renderFrame(void) {
     drawLidAnimationOverlay(fbTopL, true);
 
     u8* fbTopR = gfxGetFramebuffer(GFX_TOP, GFX_RIGHT, NULL, NULL);
-    crtEkranTemizle(fbTopR, true, kameraAcik);
+    crtEkranTemizle(fbTopR, true, false);
 
     if (uiMode == UI_STARTUP) {
         drawStartup(fbTopR, true);
@@ -12971,8 +12978,6 @@ void renderFrame(void) {
         drawShutdown(fbTopR, true);
     } else if (stationStaticFrames > 0) {
         drawStationStatic(fbTopR, true);
-    } else if (kameraAcik) {
-        kameraFrameCek(fbTopR, true);
     } else {
         vfdProsedurelCizim(fbTopR, slider3D, true);
     }
@@ -13062,7 +13067,7 @@ void adjustSetting(int delta) {
     } else if (settingsCursor == 18) {
         geigerMode = !geigerMode;
     } else if (settingsCursor == 19) {
-        cameraFlareMode = !cameraFlareMode;
+        setScreenOffMode(!screenOffMode);
     } else if (settingsCursor == 20) {
         cyberSnakeMode = !cyberSnakeMode;
     } else if (settingsCursor == 21) {
@@ -13086,7 +13091,7 @@ void adjustSetting(int delta) {
     } else if (settingsCursor == 27) {
         for (int i = 0; i < 7; i++) eqBand[i] = 100;
         masterVolume = 100;
-        playbackRatePct = 100;
+        playbackRatePct = 105;
         crtFosforGucu = 150;
         scanlineSpacing = 3;
         scanlineStrength = 28;
@@ -13104,10 +13109,13 @@ int main(void) {
     gfxSet3D(true);
     gfxSetDoubleBuffering(GFX_BOTTOM, true);
     gfxSetDoubleBuffering(GFX_TOP, true);
+    gspLcdInit();
 
     ndspInit();
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
     initBeepEngine();
     romfsInit();
+    ptmuInit();
     trigInit();
     aptSetSleepAllowed(false);
     aptHook(&aptCookie, aptEventHook, NULL);
@@ -13132,7 +13140,13 @@ int main(void) {
     startAudioThread();
     rastgeleAnimasyonSec();
 
-    while (aptMainLoop()) {
+    while (!aptShouldClose()) {
+        bool shellClosed = refreshLidAudioGuard();
+        if (!shellClosed) {
+            aptSetSleepAllowed(false);
+            aptHandleJumpToHome();
+        }
+
         hidScanInput();
 
         u32 kDown = hidKeysDown();
@@ -13178,6 +13192,41 @@ int main(void) {
         if (kDown & KEY_START) {
             uiMode = UI_SHUTDOWN;
             shutdownFrame = 0;
+            continue;
+        }
+
+        if (screenOffMode || lidClosedAudioMode) {
+            if (kDown & (KEY_X | KEY_B)) {
+                if (!lidClosedAudioMode) setScreenOffMode(false);
+                renderFrame();
+                svcSleepThread(1000000ULL);
+                continue;
+            }
+
+            if (kDown & KEY_A) {
+                if (!aktifSesHazir() && playingPlaylistCount > 0) {
+                    sarkiYukle(playingPlaylist[aktifSarkiIdx].path);
+                }
+                caliyor = !caliyor;
+                audioThreadPlaying = caliyor;
+                if (caliyor) sesKanaliniYenidenBaslat();
+            }
+
+            if (kDown & (KEY_L | KEY_ZL)) {
+                requestTrackChange(-1);
+            }
+
+            if (kDown & (KEY_R | KEY_ZR)) {
+                requestTrackChange(1);
+            }
+
+            if (audioThread && !audioThreadRunning) {
+                stopAudioThread();
+                startAudioThread();
+            }
+
+            if (!lidClosedAudioMode) renderFrame();
+            svcSleepThread(1000000ULL);
             continue;
         }
 
@@ -13240,6 +13289,9 @@ int main(void) {
                 uiMode = settingsReturnMode;
             } else if (uiMode == UI_FILE_BROWSER) {
                 browserGoParent();
+            } else if (uiMode == UI_PLAYER) {
+                uiMode = UI_FILE_BROWSER;
+                setStatusMessage("BROWSER RETURN");
             } else {
                 rotateModFull = !rotateModFull;
             }
@@ -13249,8 +13301,7 @@ int main(void) {
             if (uiMode == UI_SETTINGS) {
                 coverMode = !coverMode;
             } else if (uiMode == UI_PLAYER) {
-                if (!kameraAcik) kameraBaslat();
-                else kameraKapat();
+                setScreenOffMode(!screenOffMode);
             } else if (uiMode == UI_FILE_BROWSER) {
                 searchAudioFilesOnSd();
             } else {
@@ -13500,11 +13551,13 @@ int main(void) {
     if (pcmBufferB) linearFree(pcmBufferB);
     if (beepPcm) linearFree(beepPcm);
 
-    kameraKapat();
+    setScreenOffMode(false);
 
     romfsExit();
+    ptmuExit();
     ndspExit();
     aptUnhook(&aptCookie);
+    gspLcdExit();
     gfxExit();
 
     return 0;
