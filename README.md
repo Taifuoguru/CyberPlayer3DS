@@ -1,5 +1,25 @@
 
 
+<img width="1107" height="610" alt="Ekran görüntüsü 2026-07-02 015105" src="https://github.com/user-attachments/assets/a8569b00-0ba7-4216-a615-42c3d08870e9" />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<img width="999" height="674" alt="Ekran görüntüsü 2026-07-02 015116" src="https://github.com/user-attachments/assets/dcad15ff-11ef-4afe-b951-89b2a2c70d1c" />
+
+
+
 
 
 
@@ -20,26 +40,6 @@
 
 
 
-
-
-
-<img width="1107" height="610" alt="Ekran görüntüsü 2026-07-02 015105" src="https://github.com/user-attachments/assets/a8569b00-0ba7-4216-a615-42c3d08870e9" />
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<img width="999" height="674" alt="Ekran görüntüsü 2026-07-02 015116" src="https://github.com/user-attachments/assets/dcad15ff-11ef-4afe-b951-89b2a2c70d1c" />
 
 
 
