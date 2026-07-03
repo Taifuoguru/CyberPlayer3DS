@@ -27,11 +27,11 @@
 
 #define SES_KANALI              0
 #define BUFFER_BOYUTU           (4096 * 4)
-#define HAM_SES_BOYUTU          (1152 * 2 * 2 * 3)
+#define HAM_SES_BOYUTU          (1152 * 2 * 2 * 4)
 #define MAKS_SARKI              2048
 #define TRIG_TABLE_SIZE         8192
 
-#define VIZ_TIP_SAYISI          96
+#define VIZ_TIP_SAYISI          100
 #define VIZ_QUAD_MIX_TIPI       14
 #define QUAD_VIZ_SAYISI         4
 
@@ -115,6 +115,12 @@ int browserUnsupportedSeen = 0;
 int browserSearchDirs = 0;
 
 bool mouseMode = false;
+bool cstickMouseReady = false;
+bool mouseCursorActive = false;
+int mouseCursorX = 160;
+int mouseCursorY = 120;
+int mouseCursorIdleFrames = 0;
+int analogSeekCooldown = 0;
 bool geigerMode = false;
 bool matrixLogMode = false;
 bool screenOffMode = false;
@@ -142,6 +148,8 @@ s16* beepPcm = NULL;
 ndspWaveBuf beepWave;
 int beepPhase = 0;
 aptHookCookie aptCookie;
+volatile bool aptHomeSuspended = false;
+bool aptAudioWasPlaying = false;
 char statusMessage[96] = "SDMC READY";
 int statusMessageFrames = 0;
 int lidGuardRejectFrames = 0;
@@ -163,7 +171,7 @@ unsigned int wavSampleRate = 44100;
 unsigned char* mp3Buffer = NULL;
 s16* pcmBufferA = NULL;
 s16* pcmBufferB = NULL;
-s16 codecDecodeTemp[4096];
+s16 codecDecodeTemp[8192];
 ndspWaveBuf dalgaBlokuA;
 ndspWaveBuf dalgaBlokuB;
 
@@ -179,6 +187,11 @@ int anlikSaniye = 0;
 float sesMiksaji[12];
 
 int viz_anlik_genlik = 0;
+volatile int viz_bass_energy = 0;
+volatile int viz_mid_energy = 0;
+volatile int viz_treble_energy = 0;
+volatile int viz_beat_pulse = 0;
+volatile int viz_kick_flash = 0;
 float animasyonFaz = 0.0f;
 float globalPulse = 0.0f;
 
@@ -198,6 +211,7 @@ const char* eqPresetNames[] = {"FLAT", "ROCK", "POP", "JAZZ", "BASS", "VOCAL"};
 Thread audioThread = NULL;
 volatile bool audioThreadRunning = false;
 volatile bool audioThreadPlaying = false;
+volatile bool audioSeekBusy = false;
 
 bool dikModAktif = false;
 bool rotateModFull = false;
@@ -209,6 +223,7 @@ UiMode settingsReturnMode = UI_FILE_BROWSER;
 bool holdMode = false;
 int stationStaticFrames = 0;
 int pendingTrackDelta = 0;
+int closedControlCooldown = 0;
 int startupFrame = 0;
 int shutdownFrame = 0;
 
@@ -258,6 +273,7 @@ void textDraw(u8* fb, const char* str, int x, int y, u8 r, u8 g, u8 b, bool top)
 void textDrawCentered(u8* fb, const char* str, int y, u8 r, u8 g, u8 b, bool top);
 void renderFrame(void);
 void drawKenwoodShell(u8* fb);
+bool aktifSesHazir(void);
 
 void trigInit(void) {
     for (int i = 0; i < TRIG_TABLE_SIZE; i++) {
@@ -382,6 +398,54 @@ s16 audioProcessSample(s16 input, int channel) {
     if (y < -32700.0f) y = -32700.0f;
 
     return (s16)y;
+}
+
+s16 audioProcessSampleLite(s16 input) {
+    float y = (float)input * (masterVolume / 100.0f) * 0.88f;
+
+    if (y > 30000.0f) y = 30000.0f + (y - 30000.0f) * 0.12f;
+    if (y < -30000.0f) y = -30000.0f + (y + 30000.0f) * 0.12f;
+    if (y > 32600.0f) y = 32600.0f;
+    if (y < -32600.0f) y = -32600.0f;
+
+    return (s16)y;
+}
+
+void updateAudioReactiveMeters(s16 left, s16 right) {
+    static float bass = 0.0f;
+    static float mid = 0.0f;
+    static float treble = 0.0f;
+    static float prev = 0.0f;
+    static float bassAvg = 1.0f;
+    static int beatHold = 0;
+
+    float mono = ((float)left + (float)right) * 0.5f;
+    float absMono = fabsf(mono);
+
+    bass = bass * 0.965f + absMono * 0.035f;
+    mid = mid * 0.82f + fabsf(mono - bass) * 0.18f;
+    treble = treble * 0.70f + fabsf(mono - prev) * 0.30f;
+    prev = mono;
+
+    bassAvg = bassAvg * 0.992f + bass * 0.008f;
+
+    int b = (int)(bass / 150.0f);
+    int m = (int)(mid / 190.0f);
+    int t = (int)(treble / 260.0f);
+    if (b > 160) b = 160;
+    if (m > 160) m = 160;
+    if (t > 160) t = 160;
+
+    viz_bass_energy = (viz_bass_energy * 5 + b * 3) / 8;
+    viz_mid_energy = (viz_mid_energy * 5 + m * 3) / 8;
+    viz_treble_energy = (viz_treble_energy * 5 + t * 3) / 8;
+
+    if (beatHold > 0) beatHold--;
+    if (bass > bassAvg * 1.42f && b > 18 && beatHold == 0) {
+        viz_beat_pulse = 120;
+        viz_kick_flash = 10;
+        beatHold = 12;
+    }
 }
 
 void sesKanaliniYenidenBaslat(void) {
@@ -584,17 +648,31 @@ bool refreshLidAudioGuard(void) {
 void aptEventHook(APT_HookType hook, void* param) {
     (void)param;
     if (hook == APTHOOK_ONSUSPEND) {
+        aptHomeSuspended = true;
+        aptAudioWasPlaying = caliyor;
+        audioThreadPlaying = false;
+        audioSeekBusy = true;
+        ndspChnReset(SES_KANALI);
+    } else if (hook == APTHOOK_ONRESTORE) {
+        aptHomeSuspended = false;
+        audioSeekBusy = false;
+        aptSetSleepAllowed(false);
+        if (aptAudioWasPlaying && aktifSesHazir()) {
+            caliyor = true;
+            audioThreadPlaying = true;
+            sesKanaliniYenidenBaslat();
+        }
+        setStatusMessage("HOME RETURN AUDIO READY");
+        triggerLidAnimation();
+    } else if (hook == APTHOOK_ONSLEEP) {
         rejectSystemSleepNow();
         triggerLidAnimation();
-    } else if (hook == APTHOOK_ONRESTORE) {
-        rejectSystemSleepNow();
+    } else if (hook == APTHOOK_ONWAKEUP) {
+        aptSetSleepAllowed(false);
         if (caliyor) {
             audioThreadPlaying = true;
             sesKanaliniYenidenBaslat();
         }
-        triggerLidAnimation();
-    } else if (hook == APTHOOK_ONSLEEP || hook == APTHOOK_ONWAKEUP) {
-        rejectSystemSleepNow();
         triggerLidAnimation();
     }
 }
@@ -689,6 +767,14 @@ bool aktifSesHazir(void) {
     if (aktifSesFormati == AUDIO_FLAC) return flacDecoder != NULL;
     if (aktifSesFormati == AUDIO_OGG) return vorbisDecoder != NULL;
     return false;
+}
+
+int defaultPlaybackRateForFormat(AudioFormat fmt) {
+    return (fmt == AUDIO_MP3) ? 105 : 100;
+}
+
+void applyDefaultPlaybackRateForFormat(AudioFormat fmt) {
+    playbackRatePct = defaultPlaybackRateForFormat(fmt);
 }
 
 u16 readLE16(FILE* f) {
@@ -1096,6 +1182,7 @@ bool sarkiYukle(const char* dosyaAdi) {
 
     aktifSesKapat();
     aktifSesFormati = fmt;
+    applyDefaultPlaybackRateForFormat(aktifSesFormati);
 
     if (aktifSesFormati == AUDIO_MP3) {
         mp3Dosyasi = fopen(dosyaAdi, "rb");
@@ -1186,12 +1273,27 @@ bool sarkiYukle(const char* dosyaAdi) {
 void sarkiZamaniniDegistir(int saniyeFarki) {
     if (!aktifSesHazir()) return;
 
+    bool wasPlaying = caliyor;
+    audioSeekBusy = true;
+    audioThreadPlaying = false;
+    ndspChnReset(SES_KANALI);
+    svcSleepThread(2500000ULL);
+
     if (aktifSesFormati == AUDIO_FLAC) {
         drflac_uint64 cur = flacDecoder->currentPCMFrame;
         drflac_uint64 target = cur + (drflac_uint64)((long long)saniyeFarki * (long long)wavSampleRate);
         if (saniyeFarki < 0 && cur < (drflac_uint64)(-saniyeFarki * (int)wavSampleRate)) target = 0;
-        if (target > flacDecoder->totalPCMFrameCount) target = flacDecoder->totalPCMFrameCount;
-        drflac_seek_to_pcm_frame(flacDecoder, target);
+        if (flacDecoder->totalPCMFrameCount > 0 && target >= flacDecoder->totalPCMFrameCount) {
+            target = flacDecoder->totalPCMFrameCount - 1;
+        }
+        if (!drflac_seek_to_pcm_frame(flacDecoder, target)) {
+            setStatusMessage("FLAC SEEK RETRY");
+        }
+        hangiBufferA = true;
+        sesKanaliniYenidenBaslat();
+        caliyor = wasPlaying;
+        audioThreadPlaying = wasPlaying;
+        audioSeekBusy = false;
         return;
     }
 
@@ -1202,6 +1304,11 @@ void sarkiZamaniniDegistir(int saniyeFarki) {
         unsigned int target = (delta < 0 && cur < (unsigned int)(-delta)) ? 0 : cur + delta;
         if (target > total) target = total;
         stb_vorbis_seek(vorbisDecoder, target);
+        hangiBufferA = true;
+        sesKanaliniYenidenBaslat();
+        caliyor = wasPlaying;
+        audioThreadPlaying = wasPlaying;
+        audioSeekBusy = false;
         return;
     }
 
@@ -1227,6 +1334,12 @@ void sarkiZamaniniDegistir(int saniyeFarki) {
         mad_stream_finish(&Stream);
         mad_stream_init(&Stream);
     }
+
+    hangiBufferA = true;
+    sesKanaliniYenidenBaslat();
+    caliyor = wasPlaying;
+    audioThreadPlaying = wasPlaying;
+    audioSeekBusy = false;
 }
 
 float sesIlerlemesi01(void) {
@@ -1283,8 +1396,17 @@ void sesYuzdeyeGit(float rel) {
     if (rel < 0.0f) rel = 0.0f;
     if (rel > 1.0f) rel = 1.0f;
 
+    bool wasPlaying = caliyor;
+    audioSeekBusy = true;
+    audioThreadPlaying = false;
+    ndspChnReset(SES_KANALI);
+    svcSleepThread(2500000ULL);
+
     if (aktifSesFormati == AUDIO_FLAC && flacDecoder) {
         drflac_uint64 target = (drflac_uint64)((double)flacDecoder->totalPCMFrameCount * rel);
+        if (flacDecoder->totalPCMFrameCount > 0 && target >= flacDecoder->totalPCMFrameCount) {
+            target = flacDecoder->totalPCMFrameCount - 1;
+        }
         drflac_seek_to_pcm_frame(flacDecoder, target);
     } else if (aktifSesFormati == AUDIO_OGG && vorbisDecoder) {
         unsigned int total = stb_vorbis_stream_length_in_samples(vorbisDecoder);
@@ -1301,13 +1423,21 @@ void sesYuzdeyeGit(float rel) {
             mad_stream_init(&Stream);
         }
     }
+
+    hangiBufferA = true;
+    sesKanaliniYenidenBaslat();
+    caliyor = wasPlaying;
+    audioThreadPlaying = wasPlaying;
+    audioSeekBusy = false;
 }
 
 void sonrakiSarkiyaGec(void) {
+    bool forceNext = (screenOffMode || lidClosedAudioMode);
+
     if (shuffleMode && playingPlaylistCount > 1) {
         aktifSarkiIdx = rand() % playingPlaylistCount;
         sarkiYukle(playingPlaylist[aktifSarkiIdx].path);
-    } else if (repeatMode == 1 && aktifSesHazir()) {
+    } else if (!forceNext && repeatMode == 1 && aktifSesHazir()) {
         if (aktifSesFormati == AUDIO_WAV) {
             fseek(mp3Dosyasi, wavDataStart, SEEK_SET);
         } else if (aktifSesFormati == AUDIO_FLAC) {
@@ -1331,6 +1461,11 @@ void audioProducerThread(void* arg) {
     audioThreadRunning = true;
 
     while (audioThreadRunning) {
+        if (audioSeekBusy) {
+            svcSleepThread(1000000ULL);
+            continue;
+        }
+
         if (!audioThreadPlaying || !aktifSesHazir()) {
             svcSleepThread(1000000ULL);
             continue;
@@ -1365,9 +1500,15 @@ void audioProducerThread(void* arg) {
                 for (int i = 0; i < framesRead && toplamOrnek + 1 < HAM_SES_BOYUTU / 2; i++) {
                     s16 sL = codecDecodeTemp[i * channels];
                     s16 sR = (channels == 2) ? codecDecodeTemp[i * channels + 1] : sL;
+                    updateAudioReactiveMeters(sL, sR);
 
-                    sL = audioProcessSample(sL, 0);
-                    sR = audioProcessSample(sR, 1);
+                    if (aktifSesFormati == AUDIO_FLAC) {
+                        sL = audioProcessSampleLite(sL);
+                        sR = audioProcessSampleLite(sR);
+                    } else {
+                        sL = audioProcessSample(sL, 0);
+                        sR = audioProcessSample(sR, 1);
+                    }
 
                     ap[toplamOrnek++] = sL;
                     ap[toplamOrnek++] = sR;
@@ -1395,6 +1536,7 @@ void audioProducerThread(void* arg) {
                 while (toplamOrnek + 1 < HAM_SES_BOYUTU / 2 && ftell(mp3Dosyasi) + blockAlign <= dataEnd) {
                     s16 sL = (s16)readLE16(mp3Dosyasi);
                     s16 sR = (channels == 2) ? (s16)readLE16(mp3Dosyasi) : sL;
+                    updateAudioReactiveMeters(sL, sR);
 
                     sL = audioProcessSample(sL, 0);
                     sR = audioProcessSample(sR, 1);
@@ -1448,6 +1590,7 @@ void audioProducerThread(void* arg) {
                     for (int i = 0; i < Synth.pcm.length; i++) {
                         s16 sL = madScale(Synth.pcm.samples[0][i]);
                         s16 sR = (Synth.pcm.channels == 2) ? madScale(Synth.pcm.samples[1][i]) : sL;
+                        updateAudioReactiveMeters(sL, sR);
 
                         sL = audioProcessSample(sL, 0);
                         sR = audioProcessSample(sR, 1);
@@ -1491,7 +1634,15 @@ void startAudioThread(void) {
 
     audioThreadRunning = true;
     audioThreadPlaying = caliyor;
-    audioThread = threadCreate(audioProducerThread, NULL, 0x4000, 0x18, -2, false);
+    audioThread = threadCreate(audioProducerThread, NULL, 0x5000, 0x18, -2, false);
+    if (!audioThread) {
+        audioThread = threadCreate(audioProducerThread, NULL, 0x4000, 0x18, -2, false);
+    }
+    if (!audioThread) {
+        audioThreadRunning = false;
+        audioThreadPlaying = false;
+        setStatusMessage("AUDIO THREAD FAILED");
+    }
 }
 
 void stopAudioThread(void) {
@@ -1727,6 +1878,12 @@ void rastgeleAnimasyonSec(void) {
         return;
     }
 
+    if (aktifVizTipi >= 96) {
+        const char* bassNames[] = {"BASS-RING", "SUB-CANNON", "KICK-RADAR", "WAVE-SHOCK"};
+        snprintf(anlikVizIsmi, sizeof(anlikVizIsmi), "KENWOOD %s", bassNames[aktifVizTipi - 96]);
+        return;
+    }
+
     snprintf(
         anlikVizIsmi,
         sizeof(anlikVizIsmi),
@@ -1831,12 +1988,12 @@ void drawPerspectiveTunnel(u8* fb, int amp, u8 r, u8 g, u8 b) {
     }
 
     // Dynamic horizontal rings shifting forward for a smooth flight animation
-    float timeOffset = fmodf(animasyonFaz * 0.35f, 1.0f);
+    float timeOffset = fmodf(animasyonFaz * (0.35f + viz_bass_energy * 0.0025f), 1.0f);
     for (int row = 0; row < 12; row++) {
         float fRow = (float)row + timeOffset;
         int y = topY + (int)(fRow * 9.5f);
         int spread = 150 - (int)(fRow * 8.5f);
-        int pulse = abs((int)(sin_fast(animasyonFaz * 0.7f + row) * amp / 3));
+        int pulse = abs((int)(sin_fast(animasyonFaz * 0.7f + row) * (amp + viz_bass_energy) / 3));
 
         float depthFactor = fRow / 12.0f;
         int br = (int)((70 + pulse) * (0.2f + 0.8f * depthFactor));
@@ -1848,8 +2005,8 @@ void drawPerspectiveTunnel(u8* fb, int amp, u8 r, u8 g, u8 b) {
         }
     }
 
-    gfxCircle(fb, cx, 142, 34 + amp / 12, r, g, b, true);
-    gfxCircle(fb, cx, 142, 20 + amp / 18, r / 2, g / 2, b / 2, true);
+    gfxCircle(fb, cx, 142, 34 + amp / 12 + viz_beat_pulse / 12, r, g, b, true);
+    gfxCircle(fb, cx, 142, 20 + amp / 18 + viz_bass_energy / 20, r / 2, g / 2, b / 2, true);
 
     for (int i = 0; i < 12; i++) {
         float a = animasyonFaz * 0.12f + i * 0.52f;
@@ -1864,7 +2021,7 @@ void drawSpectrumLayer(u8* fb, int layer, int tip, int stil, int mod, int renkMo
     getColorByMode(renkModu, &cR, &cG, &cB);
 
     int shift = sagGoz ? (int)(slider3D * 9.0f) : -(int)(slider3D * 9.0f);
-    int amp = viz_anlik_genlik;
+    int amp = viz_anlik_genlik + viz_bass_energy / 2 + viz_beat_pulse / 4;
     if (amp < 4) amp = 4;
 
     int cx = 200 + shift;
@@ -2040,6 +2197,95 @@ void drawSpectrumLayer(u8* fb, int layer, int tip, int stil, int mod, int renkMo
             gfxRect(fb, x, peakY, 3, 2, 255, 40, 25, true);
         }
     }
+}
+
+void drawBassReactiveOverlay(u8* fb, u8 r, u8 g, u8 b, float slider3D, bool sagGoz) {
+    int eye = sagGoz ? 1 : -1;
+    int shift = eye * (int)(slider3D * 8.0f);
+    int cx = 200 + shift;
+    int bass = viz_bass_energy;
+    int mid = viz_mid_energy;
+    int treble = viz_treble_energy;
+    int beat = viz_beat_pulse;
+
+    if (!caliyor && bass < 4 && beat < 4) return;
+
+    int ringBase = 22 + bass / 3 + beat / 5;
+    for (int i = 0; i < 4; i++) {
+        int radius = ringBase + i * (16 + bass / 18);
+        if (radius > 150) radius = 150;
+        u8 rr = (u8)((r + beat * 2) > 255 ? 255 : (r + beat * 2));
+        u8 gg = (u8)((g + mid) > 255 ? 255 : (g + mid));
+        u8 bb = (u8)((b + treble) > 255 ? 255 : (b + treble));
+        gfxCircle(fb, cx, 118, radius, rr / (i + 1), gg / (i + 1), bb / (i + 1), true);
+    }
+
+    for (int x = 44; x < 356; x += 10) {
+        float wave = sin_fast((float)x * 0.045f + animasyonFaz * 1.15f);
+        int y = 176 + (int)(wave * (3 + bass / 18));
+        int h = 2 + bass / 28 + (abs((x + (int)frameSayaci) % 31 - 15) * treble) / 480;
+        gfxRect(fb, x + shift / 2, y - h, 5, h, r, g / 2, b / 2, true);
+    }
+
+    if (viz_kick_flash > 0) {
+        int flash = viz_kick_flash * 8;
+        gfxLine(fb, 42, 54, 358, 54, 255, flash, 40, true);
+        gfxLine(fb, 42, 178, 358, 178, 255, flash, 40, true);
+        gfxLine(fb, 42, 54, 42, 178, 255, flash, 40, true);
+        gfxLine(fb, 358, 54, 358, 178, 255, flash, 40, true);
+    }
+}
+
+void drawBassReactiveSpecial(u8* fb, int mode, u8 r, u8 g, u8 b, float slider3D, bool sagGoz) {
+    int eye = sagGoz ? 1 : -1;
+    int shift = eye * (int)(slider3D * 10.0f);
+    int cx = 200 + shift;
+    int cy = 116;
+    int bass = viz_bass_energy;
+    int mid = viz_mid_energy;
+    int treble = viz_treble_energy;
+    int beat = viz_beat_pulse;
+
+    if (mode == 96) {
+        textDrawCentered(fb, "BASS RING", 188, 255, 120, 30, true);
+        for (int i = 0; i < 22; i++) {
+            float a = i * 0.285f + animasyonFaz * 0.22f;
+            int rad = 26 + i * 5 + bass / 4;
+            int x = cx + (int)(cos_fast(a) * rad);
+            int y = cy + (int)(sin_fast(a) * (rad / 2));
+            gfxGlowPixel(fb, x, y, 255, (u8)(70 + (mid % 160)), (u8)(40 + (treble % 170)), true);
+        }
+        gfxDisc(fb, cx, cy, 8 + beat / 8, r / 3, g / 3, b / 3, true);
+    } else if (mode == 97) {
+        textDrawCentered(fb, "SUB CANNON", 188, 255, 120, 30, true);
+        for (int i = 0; i < 9; i++) {
+            int y = 62 + i * 12;
+            int len = 30 + bass + (int)(sin_fast(animasyonFaz + i) * 16);
+            gfxLine(fb, cx - len, y, cx + len, y, 255, 80 + i * 12, 30, true);
+            gfxCircle(fb, cx, y, 3 + bass / 22, r, g, b, true);
+        }
+    } else if (mode == 98) {
+        textDrawCentered(fb, "KICK RADAR", 188, 255, 120, 30, true);
+        gfxCircle(fb, cx, cy, 34 + bass / 3, r, g, b, true);
+        for (int i = 0; i < 16; i++) {
+            float a = animasyonFaz * 0.08f + i * 0.392f;
+            int len = 34 + bass + (i % 3) * mid / 3;
+            gfxLine(fb, cx, cy, cx + (int)(cos_fast(a) * len), cy + (int)(sin_fast(a) * len / 2), r, g, b, true);
+        }
+    } else {
+        textDrawCentered(fb, "WAVE SHOCK", 188, 255, 120, 30, true);
+        int prevX = 40;
+        int prevY = cy;
+        for (int x = 40; x < 360; x += 5) {
+            float a = x * 0.05f + animasyonFaz * 1.4f;
+            int y = cy + (int)(sin_fast(a) * (12 + bass / 3)) + (int)(sin_fast(a * 2.7f) * (treble / 12));
+            gfxLine(fb, prevX, prevY, x, y, 0, 220, 255, true);
+            prevX = x;
+            prevY = y;
+        }
+    }
+
+    drawBassReactiveOverlay(fb, r, g, b, slider3D, sagGoz);
 }
 
 void drawDolphinAnim(u8* fb, u8 r, u8 g, u8 b) {
@@ -12489,9 +12735,11 @@ void vfdProsedurelCizim(u8* fb, float slider3D, bool sagGoz) {
     getMColor(&cR, &cG, &cB);
 
     drawKenwoodShell(fb);
-    drawPerspectiveTunnel(fb, viz_anlik_genlik, cR, cG, cB);
+    drawPerspectiveTunnel(fb, viz_anlik_genlik + viz_bass_energy / 2, cR, cG, cB);
 
-    if (aktifVizTipi == 11) {
+    if (aktifVizTipi >= 96) {
+        drawBassReactiveSpecial(fb, aktifVizTipi, cR, cG, cB, slider3D, sagGoz);
+    } else if (aktifVizTipi == 11) {
         drawDolphinAnim(fb, cR, cG, cB);
     } else if (aktifVizTipi == 12) {
         drawStarfieldAnim(fb, cR, cG, cB);
@@ -12519,6 +12767,7 @@ void vfdProsedurelCizim(u8* fb, float slider3D, bool sagGoz) {
         drawSpectrumLayer(fb, 0, aktifVizTipi, aktifVizStili, aktifVizMod, aktifRenkModu, slider3D, sagGoz);
     }
 
+    if (aktifVizTipi < 96) drawBassReactiveOverlay(fb, cR, cG, cB, slider3D, sagGoz);
     textDrawCentered(fb, "PEAK HOLD", 188, 0, 255, 255, true);
     drawCdInsertTopAnim(fb);
 }
@@ -12547,6 +12796,21 @@ void drawHoldOverlay(u8* fb, bool top) {
     int w = top ? 400 : 320;
     gfxRect(fb, w - 72, 8, 58, 16, 40, 8, 8, top);
     textDraw(fb, "[HOLD]", w - 66, 13, 255, 80, 50, top);
+}
+
+void drawMouseCursor(u8* fb) {
+    if (!mouseCursorActive) return;
+
+    int x = mouseCursorX;
+    int y = mouseCursorY;
+
+    gfxLine(fb, x, y, x, y + 15, 0, 255, 255, false);
+    gfxLine(fb, x, y, x + 10, y + 9, 0, 255, 255, false);
+    gfxLine(fb, x + 10, y + 9, x + 5, y + 10, 0, 255, 255, false);
+    gfxLine(fb, x + 5, y + 10, x + 8, y + 17, 255, 255, 255, false);
+    gfxLine(fb, x + 4, y + 11, x + 7, y + 18, 20, 80, 90, false);
+    gfxLine(fb, x, y + 15, x + 4, y + 11, 0, 255, 255, false);
+    gfxRect(fb, x - 2, y - 2, 4, 4, 255, 80, 50, false);
 }
 
 void drawStationStatic(u8* fb, bool top) {
@@ -12592,19 +12856,42 @@ void finishPendingTrackChange(void) {
     aktifSarkiIdx = (aktifSarkiIdx + pendingTrackDelta + playingPlaylistCount) % playingPlaylistCount;
     pendingTrackDelta = 0;
 
+    bool threadWasRunning = audioThread != NULL;
+    if (threadWasRunning) stopAudioThread();
+
     if (sarkiYukle(playingPlaylist[aktifSarkiIdx].path)) {
         caliyor = true;
         audioThreadPlaying = true;
     }
+
+    if (threadWasRunning) startAudioThread();
 }
 
 void requestTrackChange(int delta) {
     if (playingPlaylistCount <= 0 || stationStaticFrames > 0) return;
 
     pendingTrackDelta = delta;
-    stationStaticFrames = 38;
     caliyor = false;
     audioThreadPlaying = false;
+
+    if (screenOffMode || lidClosedAudioMode) {
+        stationStaticFrames = 0;
+        finishPendingTrackChange();
+        return;
+    }
+
+    stationStaticFrames = 38;
+}
+
+void tickPendingTrackChange(int step) {
+    if (stationStaticFrames <= 0) return;
+    if (step < 1) step = 1;
+
+    stationStaticFrames -= step;
+    if (stationStaticFrames <= 0) {
+        stationStaticFrames = 0;
+        finishPendingTrackChange();
+    }
 }
 
 bool isSdRoot(void) {
@@ -12927,6 +13214,16 @@ void renderFrame(void) {
     frameSayaci++;
     animasyonFaz += caliyor ? 0.35f : 0.05f;
     globalPulse = sin_fast(animasyonFaz * 0.5f);
+    if (viz_beat_pulse > 0) {
+        viz_beat_pulse -= 5;
+        if (viz_beat_pulse < 0) viz_beat_pulse = 0;
+    }
+    if (viz_kick_flash > 0) viz_kick_flash--;
+    if (!caliyor) {
+        viz_bass_energy = (viz_bass_energy * 7) / 8;
+        viz_mid_energy = (viz_mid_energy * 7) / 8;
+        viz_treble_energy = (viz_treble_energy * 7) / 8;
+    }
 
     if (otomatikDegistir && caliyor && frameSayaci % 300 == 0) {
         rastgeleAnimasyonSec();
@@ -13005,6 +13302,7 @@ void renderFrame(void) {
     drawCyberSnakeOverlay(fbBot);
     drawIndustrialWarnings(fbBot, false);
     drawLidAnimationOverlay(fbBot, false);
+    drawMouseCursor(fbBot);
 
     if (holdMode) {
         drawHoldOverlay(fbTopL, true);
@@ -13012,12 +13310,7 @@ void renderFrame(void) {
         drawHoldOverlay(fbBot, false);
     }
 
-    if (stationStaticFrames > 0) {
-        stationStaticFrames--;
-        if (stationStaticFrames == 0) {
-            finishPendingTrackChange();
-        }
-    }
+    tickPendingTrackChange(1);
 
     gfxFlushBuffers();
     gfxSwapBuffers();
@@ -13064,6 +13357,8 @@ void adjustSetting(int delta) {
         matrixLogMode = !matrixLogMode;
     } else if (settingsCursor == 17) {
         mouseMode = !mouseMode;
+        mouseCursorActive = mouseMode;
+        mouseCursorIdleFrames = mouseMode ? 150 : 0;
     } else if (settingsCursor == 18) {
         geigerMode = !geigerMode;
     } else if (settingsCursor == 19) {
@@ -13091,7 +13386,7 @@ void adjustSetting(int delta) {
     } else if (settingsCursor == 27) {
         for (int i = 0; i < 7; i++) eqBand[i] = 100;
         masterVolume = 100;
-        playbackRatePct = 105;
+        playbackRatePct = defaultPlaybackRateForFormat(aktifSesFormati);
         crtFosforGucu = 150;
         scanlineSpacing = 3;
         scanlineStrength = 28;
@@ -13099,6 +13394,163 @@ void adjustSetting(int delta) {
     }
 
     triggerUiBeep(3 + settingsCursor);
+}
+
+void openBrowserEntryAt(int idx) {
+    if (idx < 0 || idx >= browserEntryCount) return;
+
+    fileCursor = idx;
+
+    if (browserEntries[idx].isDirectory) {
+        loadDirectory(browserEntries[idx].path);
+        fileCursor = 0;
+        fileScroll = 0;
+        return;
+    }
+
+    if (!isPlayableAudioFile(browserEntries[idx].path, browserEntries[idx].name)) {
+        setStatusMessage("PLAYABLE: MP3 WAV FLAC OGG");
+        return;
+    }
+
+    playingPlaylistCount = 0;
+    int selectedIdxInPlaylist = 0;
+
+    for (int i = 0; i < browserEntryCount; i++) {
+        if (!browserEntries[i].isDirectory && isPlayableAudioFile(browserEntries[i].path, browserEntries[i].name) && playingPlaylistCount < MAKS_SARKI) {
+            strncpy(playingPlaylist[playingPlaylistCount].path, browserEntries[i].path, sizeof(playingPlaylist[playingPlaylistCount].path));
+            if (i == idx) {
+                selectedIdxInPlaylist = playingPlaylistCount;
+            }
+            playingPlaylistCount++;
+        }
+    }
+
+    if (playingPlaylistCount > 0) {
+        aktifSarkiIdx = selectedIdxInPlaylist;
+        if (sarkiYukle(playingPlaylist[aktifSarkiIdx].path)) {
+            caliyor = true;
+            audioThreadPlaying = true;
+            uiMode = UI_PLAYER;
+        }
+    }
+}
+
+void togglePlaybackFromUi(void) {
+    if (!aktifSesHazir() && playingPlaylistCount > 0) {
+        sarkiYukle(playingPlaylist[aktifSarkiIdx].path);
+    }
+
+    caliyor = !caliyor;
+    audioThreadPlaying = caliyor;
+    cdAnimAktif = true;
+    cdAnimFrame = 0;
+
+    if (caliyor) {
+        sesKanaliniYenidenBaslat();
+    }
+}
+
+void virtualPointerClick(int tx, int ty) {
+    if (tx >= 276 && tx <= 314 && ty >= 4 && ty <= 40) {
+        settingsReturnMode = uiMode;
+        uiMode = UI_SETTINGS;
+        return;
+    }
+
+    if (uiMode == UI_FILE_BROWSER) {
+        if (tx >= 14 && tx <= 306 && ty >= 45 && ty <= 190) {
+            int row = (ty - 48) / 18;
+            openBrowserEntryAt(fileScroll + row);
+        }
+        return;
+    }
+
+    if (uiMode == UI_SETTINGS) {
+        if (tx >= 14 && tx <= 306 && ty >= 45 && ty <= 190) {
+            int row = (ty - 48) / 18;
+            int start = settingsCursor - 4;
+            if (start < 0) start = 0;
+            if (start > 6) start = 6;
+
+            int idx = start + row;
+            if (idx >= 0 && idx <= 27) {
+                settingsCursor = idx;
+                adjustSetting(tx < 160 ? -1 : 1);
+            }
+        }
+        return;
+    }
+
+    if (tx >= 132 && tx <= 188 && ty >= 172 && ty <= 230) {
+        togglePlaybackFromUi();
+    } else if (tx >= 72 && tx <= 116 && ty >= 178 && ty <= 222) {
+        if (playingPlaylistCount > 0) requestTrackChange(-1);
+    } else if (tx >= 204 && tx <= 248 && ty >= 178 && ty <= 222) {
+        if (playingPlaylistCount > 0) requestTrackChange(1);
+    } else if (tx >= 18 && tx <= 58 && ty >= 180 && ty <= 220) {
+        sarkiZamaniniDegistir(-15);
+    } else if (tx >= 262 && tx <= 302 && ty >= 180 && ty <= 220) {
+        sarkiZamaniniDegistir(15);
+    } else if (tx >= 18 && tx <= 302 && ty >= 126 && ty <= 134 && aktifSesHazir()) {
+        float rel = (float)(tx - 18) / 284.0f;
+        sesYuzdeyeGit(rel);
+    }
+}
+
+bool updateCstickMouse(u32 kDown) {
+    if (!cstickMouseReady) return false;
+    if (!mouseMode) {
+        mouseCursorActive = false;
+        return false;
+    }
+
+    circlePosition cstick;
+    hidCstickRead(&cstick);
+
+    int dx = cstick.dx;
+    int dy = cstick.dy;
+
+    if (abs(dx) > 10 || abs(dy) > 10) {
+        mouseCursorActive = true;
+        mouseCursorIdleFrames = 150;
+
+        mouseCursorX += dx / 22;
+        mouseCursorY -= dy / 22;
+
+        if (mouseCursorX < 0) mouseCursorX = 0;
+        if (mouseCursorX > 309) mouseCursorX = 309;
+        if (mouseCursorY < 0) mouseCursorY = 0;
+        if (mouseCursorY > 221) mouseCursorY = 221;
+    } else if (mouseCursorActive && mouseCursorIdleFrames > 0) {
+        mouseCursorIdleFrames--;
+    } else if (mouseCursorActive && !mouseMode) {
+        mouseCursorActive = false;
+    }
+
+    if (!holdMode && uiMode != UI_STARTUP && uiMode != UI_SHUTDOWN && mouseCursorActive && (kDown & KEY_A)) {
+        virtualPointerClick(mouseCursorX, mouseCursorY);
+        return true;
+    }
+
+    return false;
+}
+
+void updateCirclePadSeek(void) {
+    if (analogSeekCooldown > 0) analogSeekCooldown--;
+    if (holdMode || uiMode != UI_PLAYER || screenOffMode || lidClosedAudioMode || !aktifSesHazir()) return;
+    if (audioSeekBusy || analogSeekCooldown > 0) return;
+
+    circlePosition pad;
+    hidCircleRead(&pad);
+
+    int dx = pad.dx;
+    if (abs(dx) < 55) return;
+
+    int seconds = (abs(dx) > 115) ? 10 : 5;
+    sarkiZamaniniDegistir(dx > 0 ? seconds : -seconds);
+    setStatusMessage(dx > 0 ? "ANALOG SEEK >>" : "ANALOG SEEK <<");
+    analogSeekCooldown = (abs(dx) > 115) ? 12 : 16;
 }
 int main(void) {
     srand((unsigned int)time(NULL));
@@ -13110,6 +13562,7 @@ int main(void) {
     gfxSetDoubleBuffering(GFX_BOTTOM, true);
     gfxSetDoubleBuffering(GFX_TOP, true);
     gspLcdInit();
+    cstickMouseReady = R_SUCCEEDED(irrstInit());
 
     ndspInit();
     ndspSetOutputMode(NDSP_OUTPUT_STEREO);
@@ -13148,9 +13601,13 @@ int main(void) {
         }
 
         hidScanInput();
+        if (cstickMouseReady) irrstScanInput();
 
         u32 kDown = hidKeysDown();
         u32 kUp = hidKeysUp();
+        u32 kHeld = hidKeysHeld();
+        bool pointerConsumedA = updateCstickMouse(kDown);
+        updateCirclePadSeek();
 
         if (kDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT | KEY_L | KEY_R | KEY_ZL | KEY_ZR | KEY_SELECT | KEY_START)) {
             triggerUiBeep((int)(kDown & 0xFF));
@@ -13196,6 +13653,9 @@ int main(void) {
         }
 
         if (screenOffMode || lidClosedAudioMode) {
+            if (closedControlCooldown > 0) closedControlCooldown--;
+            tickPendingTrackChange(lidClosedAudioMode ? 6 : 1);
+
             if (kDown & (KEY_X | KEY_B)) {
                 if (!lidClosedAudioMode) setScreenOffMode(false);
                 renderFrame();
@@ -13203,24 +13663,31 @@ int main(void) {
                 continue;
             }
 
-            if (kDown & KEY_A) {
+            u32 closedKeys = kDown | ((closedControlCooldown == 0) ? kHeld : 0);
+
+            if (closedKeys & (KEY_A | KEY_ZL | KEY_ZR)) {
                 if (!aktifSesHazir() && playingPlaylistCount > 0) {
                     sarkiYukle(playingPlaylist[aktifSarkiIdx].path);
                 }
                 caliyor = !caliyor;
                 audioThreadPlaying = caliyor;
                 if (caliyor) sesKanaliniYenidenBaslat();
+                closedControlCooldown = 14;
             }
 
-            if (kDown & (KEY_L | KEY_ZL)) {
+            if (closedKeys & (KEY_L | KEY_DLEFT)) {
                 requestTrackChange(-1);
+                closedControlCooldown = 18;
             }
 
-            if (kDown & (KEY_R | KEY_ZR)) {
+            if (closedKeys & (KEY_R | KEY_DRIGHT)) {
                 requestTrackChange(1);
+                closedControlCooldown = 18;
             }
 
-            if (audioThread && !audioThreadRunning) {
+            if (!audioThread && caliyor) {
+                startAudioThread();
+            } else if (audioThread && !audioThreadRunning) {
                 stopAudioThread();
                 startAudioThread();
             }
@@ -13230,7 +13697,7 @@ int main(void) {
             continue;
         }
 
-        if (kDown & KEY_A) {
+        if ((kDown & KEY_A) && !pointerConsumedA) {
             if (uiMode == UI_FILE_BROWSER) {
                 if (browserEntryCount > 0) {
                     int idx = fileCursor;
@@ -13528,7 +13995,9 @@ int main(void) {
             }
         }
 
-        if (audioThread && !audioThreadRunning) {
+        if (!audioThread && caliyor) {
+            startAudioThread();
+        } else if (audioThread && !audioThreadRunning) {
             stopAudioThread();
             startAudioThread();
         }
@@ -13557,6 +14026,7 @@ int main(void) {
     ptmuExit();
     ndspExit();
     aptUnhook(&aptCookie);
+    if (cstickMouseReady) irrstExit();
     gspLcdExit();
     gfxExit();
 
