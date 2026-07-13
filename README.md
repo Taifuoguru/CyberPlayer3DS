@@ -1,4 +1,15 @@
 
+<img width="4000" height="3000" alt="20260713_034441" src="https://github.com/user-attachments/assets/9eba1daa-a2a3-41ae-b986-dc296c8391c0" />
+
+
+
+
+
+
+
+
+
+
 
 <img width="1107" height="610" alt="Ekran görüntüsü 2026-07-02 015105" src="https://github.com/user-attachments/assets/a8569b00-0ba7-4216-a615-42c3d08870e9" />
 
