@@ -8,7 +8,10 @@
 
 
 
+## Support
+If you enjoy this project and want to support my 3DS homebrew work, feel free to buy me a coffee!
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/taifuoguru)
 
 
 <img width="1107" height="610" alt="Ekran görüntüsü 2026-07-02 015105" src="https://github.com/user-attachments/assets/a8569b00-0ba7-4216-a615-42c3d08870e9" />
